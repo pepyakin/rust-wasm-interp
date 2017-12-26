@@ -1,7 +1,7 @@
 extern crate wasm;
 
-use std::collections::HashMap;
 use wasm::*;
+use std::collections::HashMap;
 
 struct Calc<'a> {
     acc: &'a mut u32,
@@ -34,19 +34,20 @@ impl<'a> Externals for Calc<'a> {
 }
 
 impl<'a> ImportResolver for Calc<'a> {
-    fn resolve_fn(&self, name: &str, signature: Signature) -> FuncRef {
+    fn resolve_fn(&self, store: &mut Store, name: &str, signature: Signature) -> FuncRef {
         let index = match name {
             "add" => 0,
             "sub" => 1,
             unknown => panic!("Calc doesnt provide fn {}", unknown),
         };
         assert_eq!(signature, self.signature(index));
-        FuncInstance::alloc_host(index, signature)
+        store.alloc_func_host(index, signature)
     }
 
-    fn resolve_table(&self, _name: &str, _table_def: &TableDef) -> TableRef {
-        let table_ref = TableInstance::alloc();
-        table_ref.set(0, self.resolve_fn("add", Signature { arg_count: 1 }));
+    fn resolve_table(&self, store: &mut Store, _name: &str, _table_def: &TableDef) -> TableRef {
+        let table_ref = store.alloc_table();
+        let add_fn_ref = self.resolve_fn(store, "add", Signature { arg_count: 1 });
+        store.resolve_table_mut(table_ref).set(0, add_fn_ref);
         table_ref
     }
 }
@@ -98,17 +99,20 @@ fn main() {
     let module = build_module();
     let module = validate(module);
 
+    // Create default Store.
+    let mut store = Store::default();
+
     {
         let mut externals = Calc { acc: &mut acc };
 
-        let instance = instantiate(&module, {
+        let instance = instantiate(&mut store, &module, {
             let mut imports = HashMap::new();
             imports.insert("env".into(), &externals as &ImportResolver);
             imports
         });
 
-        let func = instance.func_by_index(2); // index 2 should point on the first defined function
-        let _ = evaluate(func, &[Value(3), Value(2), Value(3)], &mut externals);
+        let args = &[Value(3), Value(2), Value(3)];
+        let _ = invoke_index(&mut store, instance, 2, args, &mut externals);
     }
 
     println!("result = {}", acc);
