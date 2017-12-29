@@ -107,8 +107,8 @@ fn main() {
             imports
         });
 
-        let func = instance.func_by_index(2); // index 2 should point on the first defined function
-        let _ = evaluate(func, &[Value(3), Value(2), Value(3)], &mut externals);
+        let args = &[Value(3), Value(2), Value(3)];
+        let _ = invoke_index(instance, 2, args, &mut externals);
     }
 
     println!("result = {}", acc);

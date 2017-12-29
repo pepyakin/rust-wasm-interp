@@ -108,7 +108,10 @@ pub type ModuleRef = Rc<ModuleInstance>;
 /// Function instance may represent either
 /// wasm function or function defined by an embedder.
 pub enum FuncInstance {
-    Wasm {
+    DefinedWasm {
+        func_def: FuncDef,
+    },
+    ImportedWasm {
         /// Module will be needed to resolve references of the code in
         /// `func`.
         module: ModuleRef,
@@ -118,8 +121,8 @@ pub enum FuncInstance {
 }
 
 impl FuncInstance {
-    fn alloc_wasm(module: ModuleRef, func_def: FuncDef) -> FuncRef {
-        Rc::new(FuncInstance::Wasm { module, func_def })
+    fn alloc_defined_wasm(func_def: FuncDef) -> FuncRef {
+        Rc::new(FuncInstance::DefinedWasm { func_def })
     }
 
     pub fn alloc_host(index: usize, signature: Signature) -> FuncRef {
@@ -128,8 +131,16 @@ impl FuncInstance {
 
     fn signature(&self) -> Signature {
         match *self {
-            FuncInstance::Wasm { ref func_def, .. } => func_def.signature,
+            FuncInstance::DefinedWasm { ref func_def, .. } |
+            FuncInstance::ImportedWasm { ref func_def, .. } => func_def.signature,
             FuncInstance::Host { ref signature, .. } => *signature,
+        }
+    }
+
+    fn func_def(&self) -> Option<&FuncDef> {
+        match *self {
+            FuncInstance::DefinedWasm { ref func_def, .. } | FuncInstance::ImportedWasm { ref func_def, .. } => Some(func_def),
+            FuncInstance::Host { .. } => None,
         }
     }
 }
@@ -230,7 +241,7 @@ pub fn instantiate<'a>(module: &ValidatedModule, imports: HashMap<String, &'a Im
 
     // Instantiate defined functions.
     for func_def in &module.funcs {
-        let func_ref = FuncInstance::alloc_wasm(instance.clone(), func_def.clone());
+        let func_ref = FuncInstance::alloc_defined_wasm(func_def.clone());
         instance.push_func(func_ref);
     }
 
@@ -252,59 +263,169 @@ pub trait Externals {
     fn signature(&self, index: usize) -> Signature;
 }
 
-pub fn evaluate<E: Externals>(func: FuncRef, args: &[Value], externals: &mut E) -> Value {
-    let (func_def, instance) = match *func {
-        FuncInstance::Wasm {
-            ref func_def,
-            ref module,
-        } => (func_def, module),
-        FuncInstance::Host { index, .. } => {
-            return externals.invoke_index(index, args);
-        }
+pub fn invoke_index<E: Externals>(
+    module_ref: ModuleRef,
+    func_index: FuncIndex,
+    args: &[Value],
+    externals: &mut E,
+) -> Value {
+    // TODO: func_index may be out of bounds,
+    let func_ref = module_ref.func_by_index(func_index);
+    invoke(module_ref, func_ref, args, externals)
+}
+
+/// Invoke a function reference abstracting the actual type of the function.
+fn invoke<E: Externals>(
+    curr_module_ref: ModuleRef,
+    invokee: FuncRef,
+    args: &[Value],
+    externals: &mut E,
+) -> Value {
+    enum InvokeKind {
+        SameModule,
+        DifferentModule(ModuleRef),
+        Host(usize),
+    }
+
+    let invoke_kind = match *invokee {
+        FuncInstance::DefinedWasm { .. } => InvokeKind::SameModule,
+        FuncInstance::ImportedWasm { ref module, .. } => InvokeKind::DifferentModule(Rc::clone(module)),
+        FuncInstance::Host { index, .. } => InvokeKind::Host(index),
     };
 
-    let locals: Vec<Value> = args.to_owned();
+    match invoke_kind {
+        InvokeKind::SameModule => evaluate(curr_module_ref, invokee, args, externals),
+        InvokeKind::DifferentModule(module) => evaluate(module, invokee, args, externals),
+        InvokeKind::Host(index) => externals.invoke_index(index, args)
+    }
+}
 
+fn pop_args(stack: &mut Vec<Value>, signature: &Signature) -> Vec<Value> {
+    let mut args = Vec::new();
+    for _ in 0..signature.arg_count {
+        args.insert(0, stack.pop().expect("Pop from empty stack"));
+    }
+    args
+}
+
+struct Frame {
+    module_ref: ModuleRef,
+    func_ref: FuncRef,
+    locals: Vec<Value>,
+    pc: usize,
+}
+
+impl Frame {
+    fn new(module_ref: ModuleRef, func_ref: FuncRef, locals: Vec<Value>) -> Frame {
+        assert!(func_ref.func_def().is_some(), "Frame can be created only for a function with a body");
+        Frame {
+            module_ref,
+            func_ref,
+            locals,
+            pc: 0,
+        }
+    }
+}
+
+fn evaluate<E: Externals>(
+    curr_module_ref: ModuleRef,
+    func_ref: FuncRef,
+    args: &[Value],
+    externals: &mut E,
+) -> Value {
     let mut value_stack: Vec<Value> = Vec::new();
+    let mut frame_stack: Vec<Frame> = Vec::new();
 
+    frame_stack.push(Frame::new(
+        Rc::clone(&curr_module_ref),
+        func_ref,
+        args.to_owned(),
+    ));
+
+    loop {
+        let mut frame = frame_stack.pop().unwrap();
+
+        let result = evaluate_func(&mut frame, &mut value_stack);
+
+        frame_stack.push(frame);
+
+        match result {
+            RunResult::Return => {
+                frame_stack.pop();
+                if frame_stack.is_empty() {
+                    // Return the value of the evaluation, since the last frame has been popped.
+                    let ret = value_stack.pop().unwrap();
+                    return ret;
+                }
+            }
+            RunResult::Invoke(nested) => {
+                let (module_ref, locals) = {
+                    let args = pop_args(&mut value_stack, &nested.signature());
+                    let module_ref = match *nested {
+                        FuncInstance::DefinedWasm { .. } => Rc::clone(&curr_module_ref),
+                        FuncInstance::ImportedWasm { ref module, .. } => Rc::clone(module),
+                        FuncInstance::Host { index, .. } => {
+                            let result = externals.invoke_index(index, &args);
+                            value_stack.push(result);
+                            continue;
+                        }
+                    };
+
+                    (module_ref, args)
+                };
+
+                frame_stack.push(Frame::new(
+                    module_ref,
+                    nested,
+                    locals,
+                ));
+            }
+        }
+    }
+}
+
+enum RunResult {
+    Invoke(FuncRef),
+    Return
+}
+
+fn evaluate_func(
+    frame: &mut Frame,
+    value_stack: &mut Vec<Value>,
+) -> RunResult {
+    let curr_module_instance = &frame.module_ref;
+    let func_def = &frame.func_ref.func_def().expect("frame could contain only functions with a body; qed");
     let body = &func_def.body;
 
     use Opcode::*;
-    for opcode in body {
+    loop {
+        if frame.pc == body.len() {
+            // Execution reached the end of the body. 
+            // In that case we do implicit return.
+            return RunResult::Return;
+        }
+
+        let opcode = &body[frame.pc];
+        frame.pc += 1;
+
         match *opcode {
             Const(value) => value_stack.push(value),
-            GetLocal(index) => value_stack.push(locals[index]),
+            GetLocal(index) => value_stack.push(frame.locals[index]),
             Call(fn_index) => {
-                let func_ref = instance.func_by_index(fn_index);
-                let args = pop_args(&mut value_stack, func_ref.signature());
-                let ret = evaluate(func_ref, &args, externals);
-                value_stack.push(ret);
+                let func_ref = curr_module_instance.func_by_index(fn_index);
+                return RunResult::Invoke(func_ref);
             }
             CallIndirect(_signature) => {
                 // Pop function index form the value stack
                 let fn_index = value_stack.pop().unwrap().0 as usize;
 
                 // Lookup function reference in the table
-                let table_ref = instance.default_table();
-                let func_ref = table_ref.get(fn_index).expect("Non null fn at index");
+                let func_ref = curr_module_instance.default_table().get(fn_index).expect("Non null fn at index");
 
                 // TODO: check expected signature against actual
 
-                let args = pop_args(&mut value_stack, func_ref.signature());
-                let ret = evaluate(func_ref, &args, externals);
-
-                value_stack.push(ret);
+                return RunResult::Invoke(func_ref);
             }
         }
     }
-
-    value_stack.pop().unwrap()
-}
-
-fn pop_args(stack: &mut Vec<Value>, signature: Signature) -> Vec<Value> {
-    let mut args = Vec::new();
-    for _ in 0..signature.arg_count {
-        args.insert(0, stack.pop().unwrap());
-    }
-    args
 }
