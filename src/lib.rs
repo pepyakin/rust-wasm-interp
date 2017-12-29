@@ -172,36 +172,36 @@ impl TableInstance {
 
 #[derive(Default)]
 pub struct ModuleInstance {
-    signatures: RefCell<Vec<Signature>>,
-    funcs: RefCell<Vec<FuncRef>>,
-    tables: RefCell<Vec<TableRef>>,
+    signatures: Vec<Signature>,
+    funcs: Vec<FuncRef>,
+    tables: Vec<TableRef>,
 }
 
 impl ModuleInstance {
-    fn push_signature(&self, signature: Signature) {
-        self.signatures.borrow_mut().push(signature);
+    fn push_signature(&mut self, signature: Signature) {
+        self.signatures.push(signature);
     }
 
-    fn push_func(&self, func: FuncRef) {
-        self.funcs.borrow_mut().push(func);
+    fn push_func(&mut self, func: FuncRef) {
+        self.funcs.push(func);
     }
 
-    fn push_table(&self, table: TableRef) {
+    fn push_table(&mut self, table: TableRef) {
         assert_eq!(
-            self.tables.borrow().len(),
+            self.tables.len(),
             0,
             "No more than 1 table is supported atm"
         );
-        self.tables.borrow_mut().push(table);
+        self.tables.push(table);
     }
 
     pub fn func_by_index(&self, index: FuncIndex) -> FuncRef {
-        self.funcs.borrow()[index].clone()
+        self.funcs[index].clone()
     }
 
     pub fn default_table(&self) -> TableRef {
         // may fail if no tables are defined/imported
-        self.tables.borrow()[0].clone()
+        self.tables[0].clone()
     }
 }
 
@@ -215,7 +215,7 @@ pub trait ImportResolver {
 pub fn instantiate<'a>(module: &ValidatedModule, imports: HashMap<String, &'a ImportResolver>) -> ModuleRef {
     let module = &module.inner;
 
-    let instance = Rc::new(ModuleInstance::default());
+    let mut instance = ModuleInstance::default();
 
     for signature in &module.signatures {
         instance.push_signature(signature.clone());
@@ -251,7 +251,7 @@ pub fn instantiate<'a>(module: &ValidatedModule, imports: HashMap<String, &'a Im
         instance.push_table(table_ref);
     }
 
-    instance
+    Rc::new(instance)
 }
 
 // -----------------------------------------------------------------------------
