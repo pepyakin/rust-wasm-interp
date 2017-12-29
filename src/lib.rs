@@ -5,7 +5,7 @@
 //! - only functions and tables are modeled,
 //! - functions are always return value,
 
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -108,21 +108,18 @@ pub type ModuleRef = Rc<ModuleInstance>;
 /// Function instance may represent either
 /// wasm function or function defined by an embedder.
 pub enum FuncInstance {
-    DefinedWasm {
-        func_def: FuncDef,
-    },
-    ImportedWasm {
+    Wasm {
         /// Module will be needed to resolve references of the code in
         /// `func`.
-        module: ModuleRef,
+        module_ref: Weak<ModuleInstance>,
         func_def: FuncDef,
     },
     Host { signature: Signature, index: usize },
 }
 
 impl FuncInstance {
-    fn alloc_defined_wasm(func_def: FuncDef) -> FuncRef {
-        Rc::new(FuncInstance::DefinedWasm { func_def })
+    fn alloc_defined_wasm(module_ref: Weak<ModuleInstance>, func_def: FuncDef) -> FuncRef {
+        Rc::new(FuncInstance::Wasm { module_ref, func_def })
     }
 
     pub fn alloc_host(index: usize, signature: Signature) -> FuncRef {
@@ -131,15 +128,14 @@ impl FuncInstance {
 
     fn signature(&self) -> Signature {
         match *self {
-            FuncInstance::DefinedWasm { ref func_def, .. } |
-            FuncInstance::ImportedWasm { ref func_def, .. } => func_def.signature,
+            FuncInstance::Wasm { ref func_def, .. } => func_def.signature,
             FuncInstance::Host { ref signature, .. } => *signature,
         }
     }
 
     fn func_def(&self) -> Option<&FuncDef> {
         match *self {
-            FuncInstance::DefinedWasm { ref func_def, .. } | FuncInstance::ImportedWasm { ref func_def, .. } => Some(func_def),
+            FuncInstance::Wasm { ref func_def, .. } => Some(func_def),
             FuncInstance::Host { .. } => None,
         }
     }
@@ -170,11 +166,18 @@ impl TableInstance {
     }
 }
 
+/// Runtime instance of a Module.
+/// 
+/// Modules are immutable after instatiation.
 #[derive(Default)]
 pub struct ModuleInstance {
     signatures: Vec<Signature>,
-    funcs: Vec<FuncRef>,
     tables: Vec<TableRef>,
+
+    // The only reason this is wrapped in a RefCell is because
+    // FuncRef have a reference back to Rc<ModuleInstance>.
+    // This is not mutated in any way after instantiation have been done.
+    funcs: RefCell<Vec<FuncRef>>,
 }
 
 impl ModuleInstance {
@@ -182,21 +185,39 @@ impl ModuleInstance {
         self.signatures.push(signature);
     }
 
-    fn push_func(&mut self, func: FuncRef) {
-        self.funcs.push(func);
+    fn push_func(&self, func: FuncRef) {
+        self.funcs
+            .try_borrow_mut()
+            .expect(
+                "push_func may be called only at instantiation time;
+                 instantiation process doesn't require both mutable and immutable ref;
+                 self.funcs can't be already borrowed;
+                 self.funcs.try_borrow_mut() shouldn't return Err;
+                 qed"
+            )
+            .push(func);
     }
 
     fn push_table(&mut self, table: TableRef) {
         assert_eq!(
             self.tables.len(),
             0,
-            "No more than 1 table is supported atm"
+            "Validation: no more than 1 table is supported atm"
         );
         self.tables.push(table);
     }
 
     pub fn func_by_index(&self, index: FuncIndex) -> FuncRef {
-        self.funcs[index].clone()
+        let funcs = self.funcs
+            .try_borrow()
+            .expect(
+                "module instances are immutable after instantiation;
+                 func_by_index may be called only after instantiation;
+                 self.funcs can't be already mutable borrowed;
+                 self.funcs.try_borrow() shouldn't return Err;
+                 qed"
+            );
+        funcs[index].clone()
     }
 
     pub fn default_table(&self) -> TableRef {
@@ -239,19 +260,24 @@ pub fn instantiate<'a>(module: &ValidatedModule, imports: HashMap<String, &'a Im
         }
     }
 
-    // Instantiate defined functions.
-    for func_def in &module.funcs {
-        let func_ref = FuncInstance::alloc_defined_wasm(func_def.clone());
-        instance.push_func(func_ref);
-    }
-
     // Instantiate defined tables.
     for _ in &module.tables {
         let table_ref = TableInstance::alloc();
         instance.push_table(table_ref);
     }
 
-    Rc::new(instance)
+    let instance = Rc::new(instance);
+
+    // Instantiate defined functions.
+    for func_def in &module.funcs {
+        let func_ref = FuncInstance::alloc_defined_wasm(
+            Rc::downgrade(&instance),
+            func_def.clone()
+        );
+        instance.push_func(func_ref);
+    }
+
+    instance
 }
 
 // -----------------------------------------------------------------------------
@@ -271,31 +297,29 @@ pub fn invoke_index<E: Externals>(
 ) -> Value {
     // TODO: func_index may be out of bounds,
     let func_ref = module_ref.func_by_index(func_index);
-    invoke(module_ref, func_ref, args, externals)
+    invoke(func_ref, args, externals)
 }
 
 /// Invoke a function reference abstracting the actual type of the function.
 fn invoke<E: Externals>(
-    curr_module_ref: ModuleRef,
     invokee: FuncRef,
     args: &[Value],
     externals: &mut E,
 ) -> Value {
     enum InvokeKind {
-        SameModule,
-        DifferentModule(ModuleRef),
+        Wasm(ModuleRef),
         Host(usize),
     }
 
     let invoke_kind = match *invokee {
-        FuncInstance::DefinedWasm { .. } => InvokeKind::SameModule,
-        FuncInstance::ImportedWasm { ref module, .. } => InvokeKind::DifferentModule(Rc::clone(module)),
+        FuncInstance::Wasm { ref module_ref, .. } => {
+            InvokeKind::Wasm(module_ref.upgrade().unwrap())
+        },
         FuncInstance::Host { index, .. } => InvokeKind::Host(index),
     };
 
     match invoke_kind {
-        InvokeKind::SameModule => evaluate(curr_module_ref, invokee, args, externals),
-        InvokeKind::DifferentModule(module) => evaluate(module, invokee, args, externals),
+        InvokeKind::Wasm(module) => evaluate(module, invokee, args, externals),
         InvokeKind::Host(index) => externals.invoke_index(index, args)
     }
 }
@@ -367,8 +391,7 @@ fn evaluate<E: Externals>(
                 let (module_ref, locals) = {
                     let args = pop_args(&mut value_stack, &nested.signature());
                     let module_ref = match *nested {
-                        FuncInstance::DefinedWasm { .. } => Rc::clone(&curr_module_ref),
-                        FuncInstance::ImportedWasm { ref module, .. } => Rc::clone(module),
+                        FuncInstance::Wasm { ref module_ref, .. } => module_ref.upgrade().unwrap(),
                         FuncInstance::Host { index, .. } => {
                             let result = externals.invoke_index(index, &args);
                             value_stack.push(result);
