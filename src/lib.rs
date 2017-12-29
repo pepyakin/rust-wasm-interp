@@ -343,11 +343,16 @@ fn evaluate<E: Externals>(
     ));
 
     loop {
-        let mut frame = frame_stack.pop().unwrap();
-
-        let result = evaluate_func(&mut frame, &mut value_stack);
-
-        frame_stack.push(frame);
+        let result = {
+            let frame = frame_stack.last_mut().expect(
+                "a frame pushed before entry to the loop;
+                frame is pushed on every a nested invoke;
+                every return from an invoke pops a frame;
+                if the return pops the last frame it returns from this function;
+                qed"
+            );
+            evaluate_func(frame, &mut value_stack)
+        };
 
         match result {
             RunResult::Return => {
